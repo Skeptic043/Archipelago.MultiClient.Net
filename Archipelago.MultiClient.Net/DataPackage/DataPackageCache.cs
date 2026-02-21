@@ -31,27 +31,25 @@ namespace Archipelago.MultiClient.Net.DataPackage
 		}
 
 		void Socket_PacketReceived(ArchipelagoPacketBase packet)
-        {
-            switch (packet)
+		{
+  		  switch (packet)
+ 		   {
+ 	       case RoomInfoPacket roomInfoPacket:
+            if (FileSystemDataPackageProvider == null)
+                FileSystemDataPackageProvider = new FileSystemCheckSumDataPackageProvider();
+            foreach (var game in GetCacheInvalidatedGamesByChecksum(roomInfoPacket))
             {
-                case RoomInfoPacket roomInfoPacket:
-	                if (FileSystemDataPackageProvider == null)
-						FileSystemDataPackageProvider = new FileSystemCheckSumDataPackageProvider();
-
-					var invalidated = GetCacheInvalidatedGamesByChecksum(roomInfoPacket);
-					if (invalidated.Any())
-                    {
-                        socket.SendPacket(new GetDataPackagePacket
-                        {
-                            Games = invalidated.ToArray()
-                        });
-                    }
-                    break;
-                case DataPackagePacket packagePacket:
-                    UpdateDataPackageFromServer(packagePacket.DataPackage);
-                    break;
+                socket.SendPacket(new GetDataPackagePacket
+                {
+                    Games = new[] { game }
+                });
             }
-        }
+            break;
+        case DataPackagePacket packagePacket:
+            UpdateDataPackageFromServer(packagePacket.DataPackage);
+            break;
+		    }
+		}
 
 		public bool TryGetDataPackageFromCache(out Dictionary<string, IGameDataLookup> gameData)
         {
@@ -100,4 +98,5 @@ namespace Archipelago.MultiClient.Net.DataPackage
 	        return gamesNeedingUpdating;
         }
 	}
+
 }
