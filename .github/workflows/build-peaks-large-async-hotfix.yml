@@ -1,0 +1,222 @@
+name: Build Peaks large-async compatibility hotfix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  HOTFIX_BRANCH: peaks-large-async-timeout-hotfix-6.6.1
+  BASE_COMMIT: dda0939d319f6671048f879688c4b2ab5cde40d4
+  PROJECT: Archipelago.MultiClient.Net/Archipelago.MultiClient.Net.csproj
+  TEST_PROJECT: Archipelago.MultiClient.Net.Tests/Archipelago.MultiClient.Net.Tests.csproj
+  OUTPUT_DLL: Archipelago.MultiClient.Net/bin/Release/netstandard2.0/Archipelago.MultiClient.Net.dll
+  ARTIFACT_DIR: hotfix-artifact
+  ARTIFACT_NAME: Archipelago-MultiClient-Net-6.6.1-Peaks-Large-Async-Hotfix
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Require the hotfix branch
+        if: github.ref != 'refs/heads/peaks-large-async-timeout-hotfix-6.6.1'
+        run: throw "Run this workflow from $env:HOTFIX_BRANCH, not $env:GITHUB_REF."
+
+      - name: Check out the hotfix branch
+        uses: actions/checkout@v7.0.0
+        with:
+          ref: peaks-large-async-timeout-hotfix-6.6.1
+          fetch-depth: 0
+
+      - name: Set up .NET 8 SDK
+        uses: actions/setup-dotnet@v5.4.0
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Verify base, scope, and versions
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $branch = git branch --show-current
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read the checked-out branch.' }
+          if ($branch -ne $env:HOTFIX_BRANCH) {
+            throw "Expected branch $env:HOTFIX_BRANCH; checked out $branch."
+          }
+
+          git cat-file -e "$($env:BASE_COMMIT)^{commit}"
+          if ($LASTEXITCODE -ne 0) { throw "Base commit $env:BASE_COMMIT is unavailable." }
+
+          $mergeBase = git merge-base $env:BASE_COMMIT HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine the merge base.' }
+          if ($mergeBase -ne $env:BASE_COMMIT) {
+            throw "HEAD is not based directly on $env:BASE_COMMIT."
+          }
+
+          $commitCount = git rev-list --count "$($env:BASE_COMMIT)..HEAD"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not count hotfix commits.' }
+          if ($commitCount -ne '2') {
+            throw "Expected exactly two hotfix commits after the base; found $commitCount."
+          }
+          $branchPoint = git rev-parse 'HEAD~2'
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine the hotfix branch point.' }
+          if ($branchPoint -ne $env:BASE_COMMIT) {
+            throw "The hotfix branch point is $branchPoint, not $env:BASE_COMMIT."
+          }
+
+          $allowedPaths = @(
+            '.github/workflows/build-peaks-large-async-hotfix.yml'
+            'Archipelago.MultiClient.Net/ArchipelagoSession.cs'
+            'README-HOTFIX.txt'
+          )
+          $range = "$($env:BASE_COMMIT)...HEAD"
+          $changedPaths = @(git diff --name-only $range)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the source diff.' }
+          $unexpectedPaths = @($changedPaths | Where-Object { $_ -notin $allowedPaths })
+          if ($unexpectedPaths.Count -ne 0) {
+            throw "Unexpected changed paths: $($unexpectedPaths -join ', ')"
+          }
+          $missingPaths = @($allowedPaths | Where-Object { $_ -notin $changedPaths })
+          if ($missingPaths.Count -ne 0) {
+            throw "Expected changed paths are missing: $($missingPaths -join ', ')"
+          }
+
+          $sourcePath = 'Archipelago.MultiClient.Net/ArchipelagoSession.cs'
+          $productCodePaths = @(git diff --name-only $range -- Archipelago.MultiClient.Net)
+          if ($productCodePaths.Count -ne 1 -or $productCodePaths[0] -ne $sourcePath) {
+            throw "Unexpected product-code diff: $($productCodePaths -join ', ')"
+          }
+
+          $numstat = git diff --numstat $range -- $sourcePath
+          if ($numstat -ne "1`t1`t$sourcePath") {
+            throw "The functional source diff is not exactly one replacement line: $numstat"
+          }
+
+          $baseSource = git show "$($env:BASE_COMMIT):$sourcePath"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read ArchipelagoSession.cs at the base commit.' }
+          if ($baseSource -notcontains '        const int ArchipelagoConnectionTimeoutInSeconds = 4;') {
+            throw 'The base commit does not contain the expected four-second timeout declaration.'
+          }
+
+          $currentSource = Get-Content -LiteralPath $sourcePath
+          if ($currentSource -notcontains '        const int ArchipelagoConnectionTimeoutInSeconds = 60;') {
+            throw 'The hotfix does not contain the expected 60-second timeout declaration.'
+          }
+          if ($currentSource -contains '        const int ArchipelagoConnectionTimeoutInSeconds = 4;') {
+            throw 'The original four-second timeout declaration is still present.'
+          }
+
+          $projectText = Get-Content -Raw -LiteralPath $env:PROJECT
+          if ($projectText -notmatch '<AssemblyVersion>6\.6\.1\.0</AssemblyVersion>') {
+            throw 'AssemblyVersion is not 6.6.1.0.'
+          }
+          if ($projectText -notmatch '<FileVersion>6\.6\.1\.0</FileVersion>') {
+            throw 'FileVersion is not 6.6.1.0.'
+          }
+          if ($projectText -notmatch '<Version>6\.6\.1</Version>') {
+            throw 'Version is not 6.6.1.'
+          }
+
+          git diff --stat $range
+          git diff --unified=3 $range -- $sourcePath
+
+      - name: Restore the netstandard2.0 target
+        run: |
+          dotnet restore $env:PROJECT -p:TargetFramework=netstandard2.0
+          if ($LASTEXITCODE -ne 0) { throw 'Restore failed.' }
+
+      - name: Build the netstandard2.0 target in Release
+        run: |
+          dotnet build $env:PROJECT --configuration Release --framework netstandard2.0 --no-restore
+          if ($LASTEXITCODE -ne 0) { throw 'Compilation failed.' }
+
+      - name: Run existing 3,000-slot message parsing test
+        run: |
+          dotnet restore $env:TEST_PROJECT -p:TargetFramework=net48
+          if ($LASTEXITCODE -ne 0) { throw 'Test restore failed.' }
+          dotnet test $env:TEST_PROJECT --configuration Release --framework net48 --no-restore --filter "FullyQualifiedName~MassiveMessageParsingFixture" --logger "console;verbosity=normal"
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed.' }
+
+      - name: Verify DLL and prepare artifact
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Test-Path -LiteralPath $env:OUTPUT_DLL -PathType Leaf)) {
+            throw "Expected netstandard2.0 output DLL does not exist: $env:OUTPUT_DLL"
+          }
+
+          $dll = Get-Item -LiteralPath $env:OUTPUT_DLL
+          Write-Host "DLL path: $($dll.FullName)"
+          Write-Host "DLL size: $($dll.Length) bytes"
+
+          $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($dll.FullName)
+          Write-Host "FileVersion: $($versionInfo.FileVersion)"
+          Write-Host "ProductVersion: $($versionInfo.ProductVersion)"
+          if ($versionInfo.FileVersion -ne '6.6.1.0') {
+            throw "Expected FileVersion 6.6.1.0; found $($versionInfo.FileVersion)."
+          }
+
+          if (Test-Path -LiteralPath $env:ARTIFACT_DIR) {
+            Remove-Item -LiteralPath $env:ARTIFACT_DIR -Recurse -Force
+          }
+          New-Item -ItemType Directory -Path $env:ARTIFACT_DIR | Out-Null
+
+          Copy-Item -LiteralPath $env:OUTPUT_DLL -Destination $env:ARTIFACT_DIR
+          Copy-Item -LiteralPath LICENSE.txt -Destination $env:ARTIFACT_DIR
+          Copy-Item -LiteralPath README-HOTFIX.txt -Destination $env:ARTIFACT_DIR
+
+          $hotfixCommit = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine the hotfix commit.' }
+          @(
+            'Upstream repository: https://github.com/ArchipelagoMW/Archipelago.MultiClient.Net'
+            "Exact upstream base commit: $env:BASE_COMMIT"
+            "Hotfix branch: $env:HOTFIX_BRANCH"
+            "Hotfix commit SHA: $hotfixCommit"
+            'Target framework: netstandard2.0'
+            'Build configuration: Release'
+            "GitHub Actions run: $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "GitHub Actions run ID: $env:GITHUB_RUN_ID"
+            "GitHub Actions run attempt: $env:GITHUB_RUN_ATTEMPT"
+          ) | Set-Content -LiteralPath "$env:ARTIFACT_DIR/BUILD-INFO.txt" -Encoding utf8NoBOM
+
+          $artifactDll = Join-Path $env:ARTIFACT_DIR $dll.Name
+          $sha256 = (Get-FileHash -LiteralPath $artifactDll -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$sha256  $($dll.Name)" | Set-Content -LiteralPath "$env:ARTIFACT_DIR/SHA256SUMS.txt" -Encoding ascii
+          Write-Host "SHA-256: $sha256"
+
+          $expectedFiles = @(
+            'Archipelago.MultiClient.Net.dll'
+            'BUILD-INFO.txt'
+            'LICENSE.txt'
+            'README-HOTFIX.txt'
+            'SHA256SUMS.txt'
+          ) | Sort-Object
+          $actualFiles = @(Get-ChildItem -LiteralPath $env:ARTIFACT_DIR -File | ForEach-Object Name | Sort-Object)
+          $difference = @(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles)
+          if ($difference.Count -ne 0) {
+            throw "Unexpected artifact contents: $($difference | Out-String)"
+          }
+          if (@($actualFiles | Where-Object { $_ -match 'PeaksOfArchipelago' }).Count -ne 0) {
+            throw 'The artifact contains a PeaksOfArchipelago file.'
+          }
+
+          Write-Host 'Artifact contents:'
+          Get-ChildItem -LiteralPath $env:ARTIFACT_DIR -File | Sort-Object Name | Format-Table Name, Length
+
+          git diff --exit-code
+          if ($LASTEXITCODE -ne 0) { throw 'The workflow modified tracked source files.' }
+          git diff --cached --exit-code
+          if ($LASTEXITCODE -ne 0) { throw 'The workflow staged source changes.' }
+
+      - name: Upload hotfix artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_DIR }}
+          if-no-files-found: error
+          retention-days: 30
